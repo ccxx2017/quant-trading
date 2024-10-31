@@ -7,9 +7,11 @@ from app.api.v1.endpoints import stocks
 from app.api.v1.endpoints import ai
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from app.api.v1.endpoints import test  
+from app.api.v1.endpoints import test 
+from app.api.v1.api import api_router 
+from app.core.scheduler import StockDataScheduler
 # 确保导入所有模型
-from app.models.stock import Stock  # 添加这行
+from app.models.stock import StockBasic
 
 
 app = FastAPI(
@@ -28,7 +30,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "Quant Trading System API"}
+    return {"message": "Stock Trading System is running"}
 
 
 # 创建数据库表
