@@ -1,4 +1,5 @@
 # app/models/__init__.py
-from app.models.stock import StockBasic as Stock, DailyData
+from .base import Base
+from .stock import Stock
 
-__all__ = ['Stock', 'DailyData']
+__all__ = ['Base', 'Stock', 'DailyData']

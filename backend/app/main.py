@@ -7,7 +7,7 @@ from app.api.v1.endpoints import stocks
 from app.api.v1.endpoints import ai
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from app.api.v1.endpoints import test 
+from tests import test
 from app.api.v1.api import api_router 
 from app.core.scheduler import StockDataScheduler
 # 确保导入所有模型

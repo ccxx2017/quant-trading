@@ -1,0 +1,1100 @@
+
+================================================================================
+File: app\main.py
+================================================================================
+
+from fastapi import FastAPI
+from app.core.config import settings
+from fastapi.middleware.cors import CORSMiddleware
+from app.core.database import engine
+from app.models import stock
+from app.api.v1.endpoints import stocks
+from app.api.v1.endpoints import ai
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from tests import test
+from app.api.v1.api import api_router 
+from app.core.scheduler import StockDataScheduler
+# 确保导入所有模型
+from app.models.stock import StockBasic
+
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json"
+)
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 在生产环境中需要修改为具体的前端域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"message": "Stock Trading System is running"}
+
+
+# 创建数据库表
+stock.Base.metadata.create_all(bind=engine)
+
+app.include_router(stocks.router, prefix=settings.API_V1_STR + "/stocks", tags=["stocks"])
+app.include_router(ai.router, prefix=settings.API_V1_STR + "/ai", tags=["ai"])
+app.include_router(test.router, prefix=settings.API_V1_STR, tags=["test"])
+# 添加静态文件挂载
+app.mount("/static", StaticFiles(directory=Path(__file__).parent.parent / "static"), name="static")
+
+================================================================================
+File: app\api\v1\api.py
+================================================================================
+
+# app/api/v1/api.py
+from fastapi import APIRouter
+from app.api.v1.endpoints import stocks
+
+api_router = APIRouter()
+api_router.include_router(stocks.router, tags=["stocks"])
+
+================================================================================
+File: app\api\v1\endpoints\ai.py
+================================================================================
+
+# app/api/v1/endpoints/ai.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from app.services.ai_service import AIService
+
+router = APIRouter()
+ai_service = AIService()
+
+@router.websocket("/ws/analyze")
+async def analyze_market_ws(websocket: WebSocket):
+    try:
+        await websocket.accept()
+        test_data = "平安银行(000001.SZ)是一家深圳的银行类上市公司，于1991年上市。"
+        await ai_service.analyze_market_stream(test_data, websocket)
+    except WebSocketDisconnect:
+        print("WebSocket disconnected")
+    except Exception as e:
+        print(f"Error in websocket: {str(e)}")
+        if websocket.client_state.CONNECTED:
+            await websocket.send_text(f"Error: {str(e)}")
+
+================================================================================
+File: app\api\v1\endpoints\stocks.py
+================================================================================
+
+# app/api/v1/endpoints/stocks.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List, Dict
+
+from app.core.database import get_db
+from app.services.stock_service import StockService
+from app.models.stock import StockBasic as Stock  # 将 StockBasic 别名为 Stock
+
+router = APIRouter()
+stock_service = StockService()
+
+@router.get("/stocks/", response_model=List[Dict])
+async def get_stocks(db: Session = Depends(get_db)):
+    """获取股票列表"""
+    return await stock_service.get_stock_list()
+
+@router.get("/stocks/{stock_code}")
+async def get_stock(stock_code: str, db: Session = Depends(get_db)):
+    """获取单个股票信息"""
+    try:
+        stock = db.query(Stock).filter(Stock.ts_code == stock_code).first()
+        if stock is None:
+            raise HTTPException(status_code=404, detail="Stock not found")
+        return stock.to_dict()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/stocks/update")
+async def update_stocks():
+    """更新股票基础数据"""
+    try:
+        result = await stock_service.update_stock_basics()
+        return {"message": "Stock data updated successfully", "status": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/stocks/daily/update")
+async def update_daily_data():
+    """更新股票日线数据"""
+    try:
+        result = await stock_service.update_daily_data()
+        return {"message": "Daily data updated successfully", "status": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+================================================================================
+File: app\core\config.py
+================================================================================
+
+from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+import os
+import asyncio
+from datetime import datetime
+import time
+
+load_dotenv()
+
+class Settings(BaseSettings):
+
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "Quant Trading System"
+    
+    # SQLite配置
+    SQLALCHEMY_DATABASE_URL: str = "sqlite:///./quant_trading.db"
+    
+    TUSHARE_TOKEN: str = os.getenv("TUSHARE_TOKEN")
+
+    ZHIPU_API_KEY: str  = os.getenv("ZHIPU_API_KEY")
+    DEFAULT_BACKTRACK_DAYS: int = 365
+    class Config:
+        case_sensitive = True
+
+
+settings = Settings()
+
+================================================================================
+File: app\core\database.py
+================================================================================
+
+# app/core/database.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from app.core.config import settings
+
+engine = create_engine(
+    settings.SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False}  # 仅用于SQLite
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def init_db():
+    # 导入所有模型，以便创建表
+    from app.models import stock
+    Base.metadata.create_all(bind=engine)
+
+================================================================================
+File: app\core\error_handler.py
+================================================================================
+
+# app/core/error_handler.py
+import logging
+import asyncio
+from typing import Callable, Any
+from functools import wraps
+from datetime import datetime
+from app.core.exceptions import DataFetchError, DatabaseError
+from app.core.config import settings
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"logs/stock_data_{datetime.now().strftime('%Y%m%d')}.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def handle_data_errors(retries: int = 3, delay: int = 1):
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            for attempt in range(retries):
+                try:
+                    if asyncio.iscoroutinefunction(func):
+                        return await func(*args, **kwargs)
+                    return func(*args, **kwargs)
+                except DataFetchError as e:
+                    logger.error(f"Data fetch error: {str(e)}, attempt {attempt + 1}/{retries}")
+                    if attempt == retries - 1:
+                        raise
+                    await asyncio.sleep(delay * (attempt + 1))
+                except DatabaseError as e:
+                    logger.error(f"Database error: {str(e)}, attempt {attempt + 1}/{retries}")
+                    if attempt == retries - 1:
+                        raise
+                    await asyncio.sleep(delay * (attempt + 1))
+                except Exception as e:
+                    logger.error(f"Unexpected error: {str(e)}")
+                    raise
+        return wrapper
+    return decorator
+
+================================================================================
+File: app\core\exceptions.py
+================================================================================
+
+# app/core/exceptions.py
+class DataFetchError(Exception):
+    """数据获取错误"""
+    pass
+
+class DatabaseError(Exception):
+    """数据库操作错误"""
+    pass
+
+================================================================================
+File: app\core\scheduler.py
+================================================================================
+
+# app/core/scheduler.py
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from app.services.stock_service import StockService
+
+class StockDataScheduler:
+    def __init__(self):
+        self.scheduler = AsyncIOScheduler()
+        # 不在初始化时创建 StockService
+        
+    async def setup_jobs(self):
+        # 每个交易日9:30-15:00期间每分钟更新
+        self.scheduler.add_job(
+            self._update_stock_basics,  # 使用类方法
+            CronTrigger(
+                day_of_week='mon-fri', 
+                hour='9-15', 
+                minute='*',
+                second='0'
+            ),
+            id='update_stock_basics',
+            misfire_grace_time=30
+        )
+        
+        # 每日收盘后更新日线数据
+        self.scheduler.add_job(
+            self._update_daily_data,  # 使用类方法
+            CronTrigger(
+                day_of_week='mon-fri',
+                hour='15',
+                minute='30'
+            ),
+            id='update_daily_data'
+        )
+
+    async def _update_stock_basics(self):
+        """包装更新方法"""
+        stock_service = StockService()
+        await stock_service.update_stock_basics()
+
+    async def _update_daily_data(self):
+        """包装更新方法"""
+        stock_service = StockService()
+        await stock_service.update_daily_data()
+
+    def start(self):
+        self.scheduler.start()
+
+    def shutdown(self):
+        self.scheduler.shutdown()
+
+================================================================================
+File: app\models\base.py
+================================================================================
+
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import DeclarativeBase
+
+# 使用新的方式创建 Base 类
+class Base(DeclarativeBase):
+    pass
+
+================================================================================
+File: app\models\daily_data.py
+================================================================================
+
+# app/models/daily_data.py
+from sqlalchemy import Column, String, Float, DateTime, Integer,func
+from sqlalchemy.orm import relationship
+from app.models.base import Base
+
+
+class DailyData(Base):
+    __tablename__ = "daily_data"
+    __table_args__ = {'extend_existing': True}  # 添加这行来允许表的重定义
+
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    stock_code = Column(String(10), index=True, nullable=False)
+    trade_date = Column(String(8), nullable=False)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)  # 对应 TuShare 的 vol
+    amount = Column(Float)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+       {'extend_existing': True},  # 允许表的重定义
+    )
+
+================================================================================
+File: app\models\stock.py
+================================================================================
+
+# app/models/stock.py
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
+
+Base = declarative_base()
+
+class StockBasic(Base):
+    __tablename__ = 'stock_basic'
+    __table_args__ = {'extend_existing': True}  # 添加这行来允许表的重定义
+
+    id = Column(Integer, primary_key=True, index=True)
+    ts_code = Column(String(10), unique=True, index=True, nullable=False)
+    symbol = Column(String(6), index=True)
+    name = Column(String(50))
+    area = Column(String(50))
+    industry = Column(String(50))
+    list_date = Column(String(8))
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'ts_code': self.ts_code,
+            'symbol': self.symbol,
+            'name': self.name,
+            'area': self.area,
+            'industry': self.industry,
+            'list_date': self.list_date
+        }
+
+class DailyData(Base):
+    __tablename__ = 'daily_data'
+
+    id = Column(Integer, primary_key=True, index=True)
+    stock_code = Column(String(10), ForeignKey('stock_basic.ts_code'), index=True)  # 修改为 stock_code
+    trade_date = Column(String(8), index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)
+    amount = Column(Float)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'stock_code': self.stock_code,
+            'trade_date': self.trade_date,
+            'open': self.open,
+            'high': self.high,
+            'low': self.low,
+            'close': self.close,
+            'volume': self.volume,
+            'amount': self.amount
+        }
+
+================================================================================
+File: app\services\ai_service.py
+================================================================================
+
+# app/services/ai_service.py
+from openai import OpenAI
+from fastapi import WebSocket
+from app.core.config import settings
+
+class AIService:
+    def __init__(self):
+        self.client = OpenAI(
+            api_key=settings.ZHIPU_API_KEY,
+            base_url="https://api.lingyiwanwu.com/v1"
+        )
+    
+    async def analyze_market_stream(self, market_data: str, websocket: WebSocket):
+        try:
+            stream = self.client.chat.completions.create(
+                model="yi-large",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是一个专业的金融分析师，请对给定的市场数据进行分析。"
+                    },
+                    {
+                        "role": "user",
+                        "content": f"请分析以下股票数据：{market_data}"
+                    }
+                ],
+                temperature=0.3,
+                stream=True
+            )
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    await websocket.send_text(chunk.choices[0].delta.content)
+                    
+        except Exception as e:
+            await websocket.send_json({"status": "error", "message": str(e)})
+
+================================================================================
+File: app\services\data_consistency.py
+================================================================================
+
+# app/services/data_consistency.py
+from datetime import datetime, timedelta
+from typing import List, Optional
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+from app.models import Stock, DailyData
+from app.core.database import get_db
+import pandas as pd
+
+class DataConsistencyService:
+    def __init__(self):
+        self.db: Session = next(get_db())
+    
+    async def verify_data_integrity(self, 
+                                  stock_code: str, 
+                                  start_date: datetime, 
+                                  end_date: datetime) -> bool:
+        # 检查数据连续性
+        daily_data = self.db.query(DailyData).filter(
+            DailyData.stock_code == stock_code,
+            DailyData.trade_date.between(
+                start_date.strftime('%Y%m%d'), 
+                end_date.strftime('%Y%m%d')
+            )
+        ).all()
+        
+        # 验证数据完整性
+        return self._check_data_sequence(daily_data)
+    
+    def _check_data_sequence(self, data: List[DailyData]) -> bool:
+        if not data:
+            return False
+        
+        # 转换为pandas DataFrame进行时间序列分析
+        df = pd.DataFrame([{
+            'trade_date': item.trade_date,
+            'stock_code': item.stock_code
+        } for item in data])
+        
+        if df.empty:
+            return False
+            
+        # 检查时间间隔是否符合预期
+        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        df = df.sort_values('trade_date')
+        date_diffs = df['trade_date'].diff().dropna()
+        
+        return all(diff <= timedelta(days=3) for diff in date_diffs)
+
+================================================================================
+File: app\services\data_fetcher.py
+================================================================================
+
+
+
+================================================================================
+File: app\services\stock_service.py
+================================================================================
+
+# app/services/stock_service.py
+import logging
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+import asyncio
+import pandas as pd
+from sqlalchemy.orm import Session
+from app.core.error_handler import handle_data_errors
+from app.services.data_consistency import DataConsistencyService
+from app.core.database import get_db
+from app.models import Stock, DailyData
+from app.core.config import settings
+import tushare as ts
+from app.core.exceptions import DataFetchError, DatabaseError
+
+# 配置日志
+logger = logging.getLogger(__name__)
+
+class StockService:
+    def __init__(self):
+        self.data_consistency = DataConsistencyService()
+        self.db: Session = next(get_db())
+        self.ts_api = ts.pro_api(settings.TUSHARE_TOKEN)
+        # 新增配置参数
+        self.BATCH_SIZE = 50  # 每批处理的股票数量
+        self.QUERY_LIMIT = 500  # 每分钟最大查询次数
+        self.SINGLE_QUERY_LIMIT = 6000  # 单次查询最大数据条数
+        self.DEFAULT_BACKTRACK_DAYS = settings.DEFAULT_BACKTRACK_DAYS  # 默认回溯天数
+
+    def _split_time_ranges(self, start_date: str, end_date: str) -> List[tuple]:
+        """将时间范围分割为适合单次查询的片段"""
+        start = pd.to_datetime(start_date)
+        end = pd.to_datetime(end_date)
+        
+        # 计算每个分片的天数（考虑单次查询限制）
+        days_per_query = self.SINGLE_QUERY_LIMIT // self.BATCH_SIZE
+        
+        time_ranges = []
+        current = start
+        while current < end:
+            next_date = min(current + timedelta(days=days_per_query), end)
+            time_ranges.append((
+                current.strftime('%Y%m%d'),
+                next_date.strftime('%Y%m%d')
+            ))
+            current = next_date + timedelta(days=1)
+        
+        return time_ranges
+    
+    async def _process_stock_batch(self, stock_codes: List[str], 
+                             start_date: str, end_date: str) -> bool:
+        """处理一批股票的数据获取"""
+        try:
+            # 使用逗号分隔的股票代码字符串
+            codes = ','.join(stock_codes)
+            
+            # 获取数据
+            df = self.ts_api.daily(
+                ts_code=codes,
+                start_date=start_date,
+                end_date=end_date
+            )
+            
+            if df is None or df.empty:
+                logger.warning(f"No data found for batch {stock_codes}")
+                return True
+            
+            # 批量插入或更新数据
+            await self._batch_update_daily_data(df)
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"Error processing batch {stock_codes}: {str(e)}")
+            return False
+
+    @handle_data_errors(retries=3)
+    async def update_stock_basics(self):
+        """更新股票基础数据"""
+        try:
+            logger.info("Starting to update stock basics...")
+            # 获取股票基本信息
+            df = self.ts_api.stock_basic(
+                # exchange='',
+                # list_status='L',
+                # fields='ts_code,symbol,name,area,industry,list_date'
+                ts_code='000001.SZ,000002.SZ,000003.SZ,000004.SZ,000005.SZ',
+                fields='ts_code,symbol,name,area,industry,list_date'
+            )
+            
+            success_count = 0
+            error_count = 0
+            
+            # 更新数据库
+            for _, row in df.iterrows():
+                try:
+                    # 首先检查是否存在
+                    existing_stock = self.db.query(Stock).filter(
+                        Stock.ts_code == row['ts_code']
+                    ).first()
+                    
+                    if existing_stock:
+                        # 更新现有记录
+                        existing_stock.symbol = row['symbol']
+                        existing_stock.name = row['name']
+                        existing_stock.area = row['area']
+                        existing_stock.industry = row['industry']
+                        existing_stock.list_date = row['list_date']
+                        existing_stock.updated_at = datetime.now()
+                    else:
+                        # 创建新记录
+                        new_stock = Stock(
+                            ts_code=row['ts_code'],
+                            symbol=row['symbol'],
+                            name=row['name'],
+                            area=row['area'],
+                            industry=row['industry'],
+                            list_date=row['list_date']
+                        )
+                        self.db.add(new_stock)
+                    
+                    success_count += 1
+                except Exception as e:
+                    error_count += 1
+                    logger.error(f"Error processing stock {row['ts_code']}: {str(e)}")
+                    continue
+            
+            # 提交所有更改
+            self.db.commit()
+            
+            logger.info(f"Successfully updated stock basics. "
+                       f"Processed: {success_count + error_count}, "
+                       f"Success: {success_count}, "
+                       f"Errors: {error_count}")
+            return True
+            
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Failed to update stock basics: {str(e)}")
+            raise DataFetchError(f"Failed to update stock basics: {str(e)}")
+
+    @handle_data_errors(retries=3)
+    async def update_daily_data(self,backtrack_days: Optional[int] = None):
+        """更新日线数据"""
+        try:
+            logger.info("Starting to update daily data...")
+            # 获取所有股票代码
+            stocks = self.db.query(Stock).all()
+            if not stocks:
+                logger.warning("No stocks found in database")
+                return False
+
+            # 计算时间范围
+            end_date = datetime.now().strftime('%Y%m%d')
+            days = backtrack_days or self.DEFAULT_BACKTRACK_DAYS
+            start_date = (datetime.now() - timedelta(days=days)).strftime('%Y%m%d')
+            
+            # 获取时间分片
+            time_ranges = self._split_time_ranges(start_date, end_date)
+            
+            # 分批处理股票
+            total_stocks = len(stocks)
+            for i in range(0, total_stocks, self.BATCH_SIZE):
+                batch_stocks = stocks[i:i + self.BATCH_SIZE]
+                stock_codes = [stock.ts_code for stock in batch_stocks]
+                
+                # 处理每个时间分片
+                for start, end in time_ranges:
+                    success = await self._process_stock_batch(stock_codes, start, end)
+                    if not success:
+                        logger.error(f"Failed to process batch {i//self.BATCH_SIZE + 1}")
+                        continue
+                    
+                    # 频率限制控制
+                    await asyncio.sleep(0.12)  # 确保不超过每分钟500次的限制
+            
+            logger.info("Successfully completed daily data update")
+            return True
+
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Failed to update daily data: {str(e)}")
+            raise DataFetchError(f"Failed to update daily data: {str(e)}")
+
+    async def get_stock_list(self) -> List[Dict]:
+        """获取股票列表"""
+        try:
+            logger.info("Fetching stock list...")
+            stocks = self.db.query(Stock).all()
+            return [stock.to_dict() for stock in stocks]
+        except Exception as e:
+            logger.error(f"Failed to get stock list: {str(e)}")
+            raise DatabaseError(f"Failed to get stock list: {str(e)}")
+        
+    async def _batch_update_daily_data(self, df: pd.DataFrame):
+        """批量更新日线数据"""
+        try:
+            for _, row in df.iterrows():
+                # 检查是否存在
+                existing_data = self.db.query(DailyData).filter(
+                    DailyData.stock_code == row['ts_code'],
+                    DailyData.trade_date == row['trade_date']
+                ).first()
+                
+                if existing_data:
+                    # 更新现有记录
+                    for column in ['open', 'high', 'low', 'close', 'vol', 'amount']:
+                        setattr(existing_data, column, row[column])
+                    existing_data.updated_at = datetime.now()
+                else:
+                    # 创建新记录
+                    new_data = DailyData(
+                        stock_code=row['ts_code'],
+                        trade_date=row['trade_date'],
+                        open=row['open'],
+                        high=row['high'],
+                        low=row['low'],
+                        close=row['close'],
+                        volume=row['vol'],
+                        amount=row['amount']
+                    )
+                    self.db.add(new_data)
+            
+            # 批量提交
+            self.db.commit()
+            
+        except Exception as e:
+            self.db.rollback()
+            raise e
+
+================================================================================
+File: scripts\collect_code.py
+================================================================================
+
+import os
+
+def collect_code(root_dir: str, output_file: str):
+    """收集项目中的代码文件并写入单个文件"""
+    
+    # 要收集的文件扩展名
+    CODE_EXTENSIONS = {'.py', '.html', '.css', '.js'}
+    
+    # 要排除的目录
+    EXCLUDE_DIRS = {'__pycache__', '.git', 'venv', '.venv', 'logs'}
+    
+    # 要排除的文件
+    EXCLUDE_FILES = {'__init__.py'}
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        for root, dirs, files in os.walk(root_dir):
+            # 排除不需要的目录
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            
+            for file in files:
+                # 检查文件扩展名
+                if os.path.splitext(file)[1] in CODE_EXTENSIONS and file not in EXCLUDE_FILES:
+                    file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(file_path, root_dir)
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as code_file:
+                            content = code_file.read()
+                            
+                            # 写入分隔符和文件路径
+                            f.write(f"\n{'='*80}\n")
+                            f.write(f"File: {relative_path}\n")
+                            f.write(f"{'='*80}\n\n")
+                            
+                            # 写入代码内容
+                            f.write(content)
+                            f.write("\n")
+                    except Exception as e:
+                        print(f"Error reading {file_path}: {e}")
+
+if __name__ == "__main__":
+    # 获取当前目录的父目录（项目根目录）
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    output_file = os.path.join(project_root, "project_code.txt")
+    
+    collect_code(project_root, output_file)
+    print(f"Code collection completed. Output saved to {output_file}")
+
+================================================================================
+File: scripts\init_db.py
+================================================================================
+
+# scripts/init_db.py
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.core.database import engine, init_db
+from app.models.stock import Base
+
+def main():
+    try:
+        print("Dropping existing tables...")
+        Base.metadata.drop_all(bind=engine)
+        
+        print("Creating new tables...")
+        init_db()
+        print("Database initialized successfully!")
+    except Exception as e:
+        print(f"Error initializing database: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+File: static\index.html
+================================================================================
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Market Analysis</title>
+    <style>
+        #output {
+            width: 100%;
+            height: 300px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-top: 10px;
+            overflow-y: auto;
+        }
+        .error {
+            color: red;
+        }
+    </style>
+</head>
+<body>
+    <button onclick="startAnalysis()">开始分析</button>
+    <div id="output"></div>
+
+    <script>
+        function startAnalysis() {
+            const output = document.getElementById('output');
+            output.innerHTML = '正在连接...<br>';
+            
+            try {
+                const ws = new WebSocket('ws://localhost:8000/api/v1/ai/ws/analyze');
+                
+                ws.onopen = function() {
+                    output.innerHTML += '连接成功！<br>';
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        output.innerHTML += event.data;
+                        output.scrollTop = output.scrollHeight;
+                    } catch (e) {
+                        output.innerHTML += `<div class="error">消息处理错误: ${e.message}</div>`;
+                    }
+                };
+                
+                ws.onerror = function(error) {
+                    console.error('WebSocket Error:', error);
+                    output.innerHTML += `<div class="error">连接错误: ${JSON.stringify(error)}</div>`;
+                };
+                
+                ws.onclose = function(event) {
+                    output.innerHTML += `<br>连接关闭 (code: ${event.code}, reason: ${event.reason || '未知原因'})<br>`;
+                };
+            } catch (e) {
+                output.innerHTML += `<div class="error">创建WebSocket失败: ${e.message}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
+
+================================================================================
+File: tests\conftest.py
+================================================================================
+
+import os
+import sys
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from app.models.base import Base
+from app.core.database import get_db
+
+# 设置项目根目录
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
+
+# 测试数据库配置
+TEST_DATABASE_URL = "sqlite:///./test.db"
+
+@pytest.fixture(scope="function")
+def test_db():
+    # 创建测试数据库引擎
+    engine = create_engine(TEST_DATABASE_URL)
+    
+    # 创建所有表
+    Base.metadata.create_all(bind=engine)
+    
+    # 创建会话
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    
+    # 提供测试数据库会话
+    try:
+        db = TestingSessionLocal()
+        yield db
+    finally:
+        db.close()
+        # 清理测试数据库
+        Base.metadata.drop_all(bind=engine)
+
+================================================================================
+File: tests\test.py
+================================================================================
+
+# app/api/v1/endpoints/test.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from app.core.database import get_db
+
+router = APIRouter()
+
+@router.get("/test_db")
+def test_database(db: Session = Depends(get_db)):
+    try:
+        # 使用 text() 包装 SQL 查询
+        result = db.execute(text("SELECT 1")).first()
+        return {"status": "success", "message": "Database connection successful", "result": result[0]}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+================================================================================
+File: tests\test_setup.py
+================================================================================
+
+# tests/test_setup.py
+import pytest
+import asyncio
+import logging
+import sys
+import os
+import logging
+from datetime import datetime, timedelta
+from app.models.daily_data import DailyData
+from app.core.config import settings
+from app.core.database import get_db, init_db, engine
+from app.core.scheduler import StockDataScheduler
+from app.services.stock_service import StockService
+from app.services.data_consistency import DataConsistencyService
+from app.models.stock import Base
+
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+async def clear_database():
+    """清空数据库"""
+    print("Clearing database...")
+    try:
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        print("✓ Database cleared successfully")
+    except Exception as e:
+        print(f"✗ Failed to clear database: {str(e)}")
+        logger.error(f"Database clearing failed: {str(e)}")
+        raise e
+
+@pytest.mark.asyncio
+async def test_system():
+    print("=== 系统测试开始 ===")
+    
+    # 0. 清空并初始化数据库
+    print("\n0. 初始化数据库...")
+    await clear_database()
+    
+    # 1. 测试数据库连接
+    print("\n1. 测试数据库连接...")
+    try:
+        db = next(get_db())
+        print("✓ 数据库连接成功")
+        logger.info("Database connection successful")
+    except Exception as e:
+        print(f"✗ 数据库连接失败: {str(e)}")
+        logger.error(f"Database connection failed: {str(e)}")
+        return
+
+    # 2. 测试 Tushare 连接和数据获取
+    print("\n2. 测试 Tushare 连接和数据获取...")
+    stock_service = StockService()
+    try:
+        # 2.1 测试基础连接
+        test_stock = stock_service.ts_api.stock_basic(
+            ts_code='000001.SZ,000002.SZ,000003.SZ,000004.SZ,000005.SZ'
+        )
+        print("✓ Tushare 连接成功")
+        print(f"示例数据: {test_stock.head(1)}")
+        logger.info("Tushare connection successful")
+        
+        # 2.2 测试基础数据更新
+        await stock_service.update_stock_basics()
+        logger.info("Basic stock data updated successfully")
+        print("✓ 基础数据保存成功")
+        
+        # 2.3 测试批量数据获取
+        # 使用较短的回溯期进行测试
+        test_backtrack_days = 5
+        await stock_service.update_daily_data(backtrack_days=test_backtrack_days)
+        print("✓ 批量数据获取成功")
+        logger.info(f"Daily data updated successfully with {test_backtrack_days} days backtrack")
+        
+        # 2.4 验证数据是否正确保存
+        db = next(get_db())
+        daily_count = db.query(DailyData).count()
+        print(f"✓ 已保存 {daily_count} 条日线数据")
+        logger.info(f"Saved {daily_count} daily records")
+        
+    except Exception as e:
+        print(f"✗ Tushare 测试失败: {str(e)}")
+        logger.error(f"Tushare test failed: {str(e)}")
+        return
+
+    # 3. 测试调度器
+    print("\n3. 测试调度器...")
+    try:
+        scheduler = StockDataScheduler()
+        await scheduler.setup_jobs()
+        scheduler.start()
+        print("✓ 调度器启动成功")
+        logger.info("Scheduler started successfully")
+        
+        # 运行几秒后关闭
+        await asyncio.sleep(5)
+        scheduler.shutdown()
+        print("✓ 调度器关闭成功")
+        logger.info("Scheduler shutdown successfully")
+    except Exception as e:
+        print(f"✗ 调度器测试失败: {str(e)}")
+        logger.error(f"Scheduler test failed: {str(e)}")
+
+    # 4. 测试数据一致性服务
+    print("\n4. 测试数据一致性服务...")
+    try:
+        # 先确保有测试数据
+        await stock_service.update_daily_data()
+        logger.info("Daily data updated for consistency check")
+        
+        consistency_service = DataConsistencyService()
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=7)
+        result = await consistency_service.verify_data_integrity(
+            "000001.SZ", 
+            start_date,
+            end_date
+        )
+        print(f"✓ 数据一致性检查完成，结果: {result}")
+        logger.info(f"Data consistency check completed with result: {result}")
+    except Exception as e:
+        print(f"✗ 数据一致性服务测试失败: {str(e)}")
+        logger.error(f"Data consistency test failed: {str(e)}")
+
+    print("\n=== 系统测试完成 ===")
+
+# 运行测试
+if __name__ == "__main__":
+    try:
+        asyncio.run(test_system())
+    except KeyboardInterrupt:
+        print("\n测试被用户中断")
+        logger.info("Test interrupted by user")
+    except Exception as e:
+        print(f"\n测试过程中发生错误: {str(e)}")
+        logger.error(f"Test failed with error: {str(e)}")

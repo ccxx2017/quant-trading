@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.models import Stock, DailyData
+from app.models import Stock
+from app.models.stock import DailyData
 from app.core.database import get_db
 import pandas as pd
 

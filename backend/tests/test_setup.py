@@ -1,19 +1,27 @@
 # tests/test_setup.py
+import pytest
 import asyncio
+import logging
 import sys
 import os
 import logging
 from datetime import datetime, timedelta
+from sqlalchemy import text
 
-# 添加项目根目录到Python路径
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 获取项目根目录的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(current_dir)
+# 将项目根目录添加到Python路径
+sys.path.insert(0, project_root)
 
+from app.models.stock import DailyData
 from app.core.config import settings
 from app.core.database import get_db, init_db, engine
 from app.core.scheduler import StockDataScheduler
 from app.services.stock_service import StockService
 from app.services.data_consistency import DataConsistencyService
 from app.models.stock import Base
+
 
 # 配置日志
 logging.basicConfig(
@@ -22,10 +30,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 async def clear_database():
     """清空数据库"""
     print("Clearing database...")
     try:
+        # 使用正确的方式执行 SQL
+        with engine.connect() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_daily_data_stock_code"))
+            conn.commit()
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
         print("✓ Database cleared successfully")
@@ -34,6 +47,7 @@ async def clear_database():
         logger.error(f"Database clearing failed: {str(e)}")
         raise e
 
+@pytest.mark.asyncio
 async def test_system():
     print("=== 系统测试开始 ===")
     
@@ -53,10 +67,10 @@ async def test_system():
         return
 
     # 2. 测试 Tushare 连接和数据获取
-    print("\n2. 测试 Tushare 连接...")
+    print("\n2. 测试 Tushare 连接和数据获取...")
     stock_service = StockService()
     try:
-        # 只获取前5支股票的数据作为测试
+        # 2.1 测试基础连接
         test_stock = stock_service.ts_api.stock_basic(
             ts_code='000001.SZ,000002.SZ,000003.SZ,000004.SZ,000005.SZ'
         )
@@ -64,10 +78,24 @@ async def test_system():
         print(f"示例数据: {test_stock.head(1)}")
         logger.info("Tushare connection successful")
         
-        # 保存基础数据
+        # 2.2 测试基础数据更新
         await stock_service.update_stock_basics()
         logger.info("Basic stock data updated successfully")
         print("✓ 基础数据保存成功")
+        
+        # 2.3 测试批量数据获取
+        # 使用较短的回溯期进行测试
+        test_backtrack_days = 5
+        await stock_service.update_daily_data(backtrack_days=test_backtrack_days)
+        print("✓ 批量数据获取成功")
+        logger.info(f"Daily data updated successfully with {test_backtrack_days} days backtrack")
+        
+        # 2.4 验证数据是否正确保存
+        db = next(get_db())
+        daily_count = db.query(DailyData).count()
+        print(f"✓ 已保存 {daily_count} 条日线数据")
+        logger.info(f"Saved {daily_count} daily records")
+        
     except Exception as e:
         print(f"✗ Tushare 测试失败: {str(e)}")
         logger.error(f"Tushare test failed: {str(e)}")

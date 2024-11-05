@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     TUSHARE_TOKEN: str = os.getenv("TUSHARE_TOKEN")
 
     ZHIPU_API_KEY: str  = os.getenv("ZHIPU_API_KEY")
+    DEFAULT_BACKTRACK_DAYS: int = 365
     class Config:
         case_sensitive = True
 
