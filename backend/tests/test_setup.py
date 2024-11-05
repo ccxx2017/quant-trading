@@ -49,6 +49,7 @@ async def clear_database():
 
 @pytest.mark.asyncio
 async def test_system():
+    """测试系统功能"""
     print("=== 系统测试开始 ===")
     
     # 0. 清空并初始化数据库
@@ -57,14 +58,10 @@ async def test_system():
     
     # 1. 测试数据库连接
     print("\n1. 测试数据库连接...")
-    try:
-        db = next(get_db())
-        print("✓ 数据库连接成功")
-        logger.info("Database connection successful")
-    except Exception as e:
-        print(f"✗ 数据库连接失败: {str(e)}")
-        logger.error(f"Database connection failed: {str(e)}")
-        return
+    print("\n1. 测试数据库连接...")
+    db = next(get_db())
+    assert db is not None, "数据库连接失败"
+    print("✓ 数据库连接成功")
 
     # 2. 测试 Tushare 连接和数据获取
     print("\n2. 测试 Tushare 连接和数据获取...")
